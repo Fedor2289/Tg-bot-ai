@@ -5182,8 +5182,9 @@ def _on_text_inner(msg):
                 _answer = ask_ai(_prompt, chat_id=_uid, dm_mode=(_stage >= 2))
                 if _answer:
                     send(_uid, f"{_prefix} {_answer}", kb=_kb)
-                    if VOICE_ENABLED and _stage >= 4:
-                        send_voice_msg(_uid, _answer[:120])
+                    # Голосовое сообщение всегда (как настоящий ИИ-голос)
+                    if VOICE_ENABLED:
+                        send_voice_msg(_uid, _answer[:200])
 
             _pool.submit(_ai_dialog)
             return
@@ -6080,8 +6081,51 @@ def _send_group_voice(chat_id: int, text: str):
 
 
 def group_ai_respond(chat_id: int, prompt: str, sender_name: str = ""):
-    """ИИ отвечает в группу текстом + голосовым. v19"""
+    """ИИ отвечает в группу. Сначала даёт 15с админу ответить самому."""
     full_prompt = f"{sender_name}: {prompt}" if sender_name else prompt
+
+    # Уникальный ключ перехвата
+    import uuid as _u2
+    _ic_key = f"grp_{chat_id}_{_u2.uuid4().hex[:8]}"
+    _ic_data = {"cancelled": False, "chat_id": chat_id, "group": True, "msg_ids": []}
+
+    # Отменяем старые перехваты для этой группы
+    for _old in list(_ai_intercept.keys()):
+        if _ai_intercept[_old].get("chat_id") == chat_id and _ai_intercept[_old].get("group"):
+            _ai_intercept[_old]["cancelled"] = True
+            old_ic = _ai_intercept.pop(_old)
+            for _mid_pair in old_ic.get("msg_ids", []):
+                try:
+                    bot.edit_message_reply_markup(
+                        chat_id=_mid_pair[0], message_id=_mid_pair[1], reply_markup=None)
+                except Exception:
+                    pass
+
+    _ai_intercept[_ic_key] = _ic_data
+
+    # Уведомляем всех админов
+    for _aid in list(admins):
+        try:
+            _kbi = InlineKeyboardMarkup()
+            _kbi.add(InlineKeyboardButton(
+                "✍️ Ответить за ИИ",
+                callback_data=f"ai_ic_{_ic_key}_{_aid}"
+            ))
+            _sent = bot.send_message(_aid,
+                f"👥 Группа | {sender_name}: «{prompt[:150]}»\n⏱ 15с → ответь сам или ИИ ответит",
+                reply_markup=_kbi)
+            _ic_data["msg_ids"].append((_aid, _sent.message_id))
+        except Exception:
+            pass
+
+    # Ждём 15с
+    time.sleep(15)
+
+    _ic = _ai_intercept.pop(_ic_key, {})
+    if _ic.get("cancelled"):
+        return None  # Админ ответил сам
+
+    # ИИ отвечает
     answer = ask_ai(full_prompt, chat_id=chat_id)
     if answer:
         send_group(chat_id, f"🤖 ИИ: {answer}")

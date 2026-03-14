@@ -96,7 +96,25 @@ adm_state= {}    # admin_uid → {step, target_uid}
 admins   = set() # все admin'ы (включая ADMIN_ID)
 
 # Пул потоков для фоновых задач (не плодим бесконечные Thread'ы)
-_pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix="horror")
+_pool_raw = ThreadPoolExecutor(max_workers=32, thread_name_prefix="horror")
+
+def _safe_submit(fn, *args, **kwargs):
+    """Обёртка над pool.submit — логирует ошибки в потоках."""
+    def _wrapped():
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            log.debug(f"pool task {fn.__name__} crashed: {traceback.format_exc()[:300]}")
+    return _pool_raw.submit(_wrapped)
+
+class _SafePool:
+    """Обёртка ThreadPoolExecutor с автоматическим логированием ошибок."""
+    def submit(self, fn, *args, **kwargs):
+        return _safe_submit(fn, *args, **kwargs)
+    def shutdown(self, **kw):
+        return _pool_raw.shutdown(**kw)
+
+_pool = _SafePool()
 
 _kb_cache = {}   # кеш клавиатур
 
@@ -167,10 +185,13 @@ def is_stage_frozen(uid):
 
 def send_group(chat_id, text, kb=None):
     """Отправляет сообщение в группу."""
-    if kb:
-        _safe_call(bot.send_message, chat_id, text, reply_markup=kb)
-    else:
-        _safe_call(bot.send_message, chat_id, text)
+    try:
+        if kb:
+            _safe_call(bot.send_message, chat_id, text, reply_markup=kb)
+        else:
+            _safe_call(bot.send_message, chat_id, text)
+    except Exception as _e:
+        log.debug(f"send_group() error chat={chat_id}: {_e}")
 
 def U(uid):
     """Потокобезопасное создание/получение профиля пользователя."""
@@ -258,11 +279,14 @@ def _safe_call(fn, *args, retries=3, **kwargs):
     return None
 
 def send(uid, text, kb=None):
-    _spam_mark(uid)
-    if kb:
-        _safe_call(bot.send_message, uid, text, reply_markup=kb)
-    else:
-        _safe_call(bot.send_message, uid, text)
+    try:
+        _spam_mark(uid)
+        if kb:
+            _safe_call(bot.send_message, uid, text, reply_markup=kb)
+        else:
+            _safe_call(bot.send_message, uid, text)
+    except Exception as _e:
+        log.debug(f"send() error uid={uid}: {_e}")
 
 def sgif(uid, url):
     _safe_call(bot.send_animation, uid, url)
@@ -5112,9 +5136,28 @@ def _on_text_inner(msg):
                     _prompt = (f"Жертва {_name} спросила: '{_q}'. "
                                f"Ты — зло. Игнорируй вопрос. Угрожай. 1 предложение.")
 
-                # Уведомляем админа — он может перехватить
-                _ic_key = f"{_uid}_{int(time.time())}"
-                _ai_intercept[_ic_key] = {"cancelled": False, "uid": _uid}
+                # Отменяем предыдущие перехваты этого пользователя
+                for _old_key in list(_ai_intercept.keys()):
+                    if _ai_intercept[_old_key].get("uid") == _uid:
+                        _ai_intercept[_old_key]["cancelled"] = True
+                        # Убираем старую кнопку у всех админов
+                        old_ic = _ai_intercept.pop(_old_key)
+                        for _old_mid in old_ic.get("msg_ids", []):
+                            try:
+                                bot.edit_message_reply_markup(
+                                    chat_id=_old_mid[0],
+                                    message_id=_old_mid[1],
+                                    reply_markup=None
+                                )
+                            except Exception:
+                                pass
+
+                # Создаём новый перехват
+                import uuid as _uuid
+                _ic_key = f"{_uid}_{_uuid.uuid4().hex[:8]}"
+                _ic_data = {"cancelled": False, "uid": _uid, "msg_ids": []}
+                _ai_intercept[_ic_key] = _ic_data
+
                 for _aid in list(admins):
                     try:
                         _kbi = InlineKeyboardMarkup()
@@ -5122,9 +5165,10 @@ def _on_text_inner(msg):
                             "✍️ Ответить за ИИ",
                             callback_data=f"ai_ic_{_ic_key}_{_aid}"
                         ))
-                        bot.send_message(_aid,
+                        _sent = bot.send_message(_aid,
                             f"👤 {_name} (стадия:{_stage}): «{_q[:150]}»\n⏱ 15с → ответь сам или ИИ ответит",
                             reply_markup=_kbi)
+                        _ic_data["msg_ids"].append((_aid, _sent.message_id))
                     except Exception:
                         pass
 
